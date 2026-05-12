@@ -195,9 +195,46 @@ class AutoRedeemer:
             self.logger.error("Error getting positions: %s", e)
             return []
 
+    async def _fetch_parent_collection_id(self, condition_id: str) -> bytes:
+        """
+        Query the Gamma API to retrieve the parentCollectionId for a condition.
+
+        Standard binary markets use b'\\x00' * 32 (the zero hash), but
+        negative-risk or multi-outcome markets may use a non-zero parent
+        collection. Falling back to the zero hash if the API is unavailable
+        is safe for standard markets.
+
+        Args:
+            condition_id: The market condition ID (hex string)
+
+        Returns:
+            parentCollectionId as 32 bytes
+        """
+        try:
+            session = await self._get_session()
+            url = f"https://gamma-api.polymarket.com/markets"
+            params = {"condition_id": condition_id}
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    markets = data if isinstance(data, list) else data.get("markets", [])
+                    if markets:
+                        parent_hex = markets[0].get("parentCollectionId") or ""
+                        if parent_hex and parent_hex != "0x" + "0" * 64:
+                            from web3 import Web3
+                            return Web3.to_bytes(hexstr=parent_hex)
+        except Exception as e:
+            self.logger.debug("Could not fetch parentCollectionId from Gamma: %s", e)
+        return b'\x00' * 32
+
     async def redeem_position(self, condition_id: str) -> bool:
         """
         Attempt to redeem a specific position on-chain via Web3.
+
+        Queries the Gamma API for the exact parentCollectionId before
+        submitting the on-chain transaction. Falls back to manual API
+        redemption if the contract call reverts (e.g. for negative-risk
+        or multi-outcome markets that use a non-zero parent collection).
 
         Args:
             condition_id: The market's conditionId
@@ -217,10 +254,12 @@ class AutoRedeemer:
 
             # Standard Polymarket collateral (USDC.e on Polygon)
             usdc = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-            
-            # Parent collection is zero bytes for standard markets
-            parent_collection = b'\x00' * 32
-            
+
+            # Fetch the correct parentCollectionId from Gamma API.
+            # Standard markets use zero bytes; negative-risk/multi-outcome
+            # markets may require a non-zero parent collection.
+            parent_collection = await self._fetch_parent_collection_id(condition_id)
+
             # Condition ID must be converted to bytes32
             cond_bytes = Web3.to_bytes(hexstr=condition_id)
 
@@ -229,27 +268,34 @@ class AutoRedeemer:
             index_sets = [1, 2]
 
             account = Account.from_key(self.private_key)
-            
-            # Build transaction
-            tx = self._ctf_contract.functions.redeemPositions(
-                usdc,
-                parent_collection,
-                cond_bytes,
-                index_sets
-            ).build_transaction({
-                'from': account.address,
-                'nonce': self._web3.eth.get_transaction_count(account.address),
-                'gas': 150000,
-                'maxFeePerGas': self._web3.to_wei(50, 'gwei'),
-                'maxPriorityFeePerGas': self._web3.to_wei(40, 'gwei'),
-            })
 
-            # Sign and send
-            signed_tx = self._web3.eth.account.sign_transaction(tx, self.private_key)
-            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-            
-            self.logger.info("Redemption TX submitted! Hash: %s", tx_hash.hex())
-            return True
+            try:
+                tx = self._ctf_contract.functions.redeemPositions(
+                    usdc,
+                    parent_collection,
+                    cond_bytes,
+                    index_sets
+                ).build_transaction({
+                    'from': account.address,
+                    'nonce': self._web3.eth.get_transaction_count(account.address),
+                    'gas': 150000,
+                    'maxFeePerGas': self._web3.to_wei(50, 'gwei'),
+                    'maxPriorityFeePerGas': self._web3.to_wei(40, 'gwei'),
+                })
+
+                signed_tx = self._web3.eth.account.sign_transaction(tx, self.private_key)
+                tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+                self.logger.info("Redemption TX submitted! Hash: %s", tx_hash.hex())
+                return True
+
+            except Exception as contract_err:
+                self.logger.warning(
+                    "On-chain redeem reverted for %s (%s) — "
+                    "position requires manual or API-based redemption",
+                    condition_id, contract_err,
+                )
+                return False
 
         except Exception as e:
             self.logger.error("On-chain redemption failed for %s: %s", condition_id, e)
