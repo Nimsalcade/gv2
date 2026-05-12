@@ -308,30 +308,54 @@ class PositionMerger:
             # Partition for binary market: [1, 2] (YES=1, NO=2)
             partition = [1, 2]
 
-            # Build transaction
-            # Note: For neg_risk markets, use NegRiskAdapter instead
-            contract_address = (
-                POLYGON_CONTRACTS["neg_risk_adapter"] if is_neg_risk
-                else POLYGON_CONTRACTS["conditional_tokens"]
-            )
+            # For neg_risk markets the NegRiskAdapter holds the collateral,
+            # so its address must be used as the contract target. For standard
+            # binary markets we use the ConditionalTokens contract directly.
+            if is_neg_risk:
+                from web3 import Web3 as _Web3
+                contract_address = _Web3.to_checksum_address(POLYGON_CONTRACTS["neg_risk_adapter"])
+                ctf = self._web3.eth.contract(
+                    address=contract_address,
+                    abi=CONDITIONAL_TOKENS_ABI,
+                )
+            else:
+                ctf = self._ctf_contract
 
-            # This is a simplified example - full implementation would need:
-            # 1. Proper nonce management
-            # 2. Gas price estimation
-            # 3. Transaction signing
-            # 4. Receipt waiting
+            # Derive account from the private key held by this instance.
+            # The private_key attribute is populated by the caller via
+            # KeyManager.load_and_decrypt() — it is never written to disk
+            # in plaintext form by this class.
+            account = self._web3.eth.account.from_key(self.private_key)
+            nonce = self._web3.eth.get_transaction_count(account.address)
 
-            self.logger.warning(
-                "Full merge implementation requires web3 transaction signing. "
-                "See samples/warproxxx-maker/poly_merger/merge.js for reference."
+            tx = ctf.functions.mergePositions(
+                Web3.to_checksum_address(POLYGON_CONTRACTS["usdc"]),
+                b'\x00' * 32,
+                Web3.to_bytes(hexstr=condition_id),
+                partition,
+                raw_amount,
+            ).build_transaction({
+                'from': account.address,
+                'nonce': nonce,
+                'gas': self.GAS_PER_MERGE + 10000,
+                'maxFeePerGas': self._web3.to_wei(50, 'gwei'),
+                'maxPriorityFeePerGas': self._web3.to_wei(40, 'gwei'),
+            })
+
+            signed_tx = self._web3.eth.account.sign_transaction(tx, self.private_key)
+            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+            self.logger.info(
+                "Merge TX submitted | condition=%s | amount=%.4f | tx=%s",
+                condition_id[:16], amount, tx_hash.hex(),
             )
 
             return MergeResult(
-                success=False,
-                amount_merged=0,
-                gas_used=0,
+                success=True,
+                amount_merged=amount,
+                gas_used=self.GAS_PER_MERGE,
                 gas_saved_estimate=gas_estimate["savings_gas"],
-                error="Full implementation pending - use poly_merger/merge.js"
+                tx_hash=tx_hash.hex(),
             )
 
         except Exception as e:

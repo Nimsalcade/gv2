@@ -309,8 +309,48 @@ class MakerLoop:
                 # ── LIQUIDATION logic removed ──
 
                 # ── HOLD: window closing soon ──
+                # Farming and order posting are stopped, but burst snipes are
+                # still allowed — massive volatility often occurs in the final
+                # minutes before settlement.
                 if state == LoopState.HOLD:
-                    await _burst_sleep(5.0)
+                    got_burst_in_hold = False
+                    if burst_signal is not None:
+                        try:
+                            await asyncio.wait_for(burst_signal.wait(), timeout=1.0)
+                            if burst_signal.is_set and (now - last_burst_handled_at) > 2.0:
+                                got_burst_in_hold = True
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        _spike = spike_detector.check(price_feed)
+                        if _spike.is_snipe and (now - last_burst_handled_at) > 2.0:
+                            got_burst_in_hold = True
+
+                    if got_burst_in_hold:
+                        last_burst_handled_at = time.time()
+                        direction = (
+                            burst_signal.direction if burst_signal is not None
+                            else _spike.direction
+                        )
+                        momentum = (
+                            (burst_signal.momentum or 0.0) if burst_signal is not None
+                            else (_spike.momentum_5s or 0.0)
+                        )
+                        self.logger.info(
+                            "🎯 HOLD-STATE BURST | direction=%s | 5s=%+.4f%% | market=%s",
+                            direction, momentum, market_id[:16],
+                        )
+                        if summary.signal_direction is None:
+                            summary.signal_direction  = direction
+                            summary.signal_fired_at_s = elapsed_s
+
+                        if snipe_slot is not None and snipe_slot.last_result is not None:
+                            snipe_result = snipe_slot.last_result
+                            if snipe_result.success:
+                                snipe_latencies.append(snipe_result.latency_ms)
+                            snipe_slot.last_result = None
+                    else:
+                        await asyncio.sleep(1.0)
                     continue
 
                 # ── COOLDOWN: check for expiry (sacred — burst does NOT override) ──

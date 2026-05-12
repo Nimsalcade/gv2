@@ -261,15 +261,27 @@ class TradingBot:
         The CLOB consistently returns the *available* balance in this field —
         i.e. balance minus resting-order reservations minus matched-but-unfilled.
         Trusting it lets us correctly track headroom without extra round trips.
+
+        If the regex cannot extract the balance but the error message indicates
+        an insufficient-funds condition, we force a hard API refresh so the
+        cached balance does not permanently gate future orders.
         """
         match = _BALANCE_RE.search(error_message or "")
-        if not match:
-            return
-        try:
-            self._cached_balance_micro = int(match.group(1))
-            self._balance_cached_at = time.monotonic()
-        except (TypeError, ValueError):
-            pass
+        if match:
+            try:
+                self._cached_balance_micro = int(match.group(1))
+                self._balance_cached_at = time.monotonic()
+                return
+            except (TypeError, ValueError):
+                pass
+
+        error_lower = str(error_message).lower()
+        if "balance" in error_lower or "funds" in error_lower:
+            self.logger.warning(
+                "Balance regex failed on error — forcing hard refresh: %s",
+                (error_message or "")[:120],
+            )
+            self._refresh_balance()
 
     def _can_afford(self, price: float, size: float) -> bool:
         """True if our cached balance can plausibly cover this order plus fees.

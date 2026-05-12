@@ -176,15 +176,24 @@ class Sniper:
                     latency_ms=latency_ms, error=f"price_too_low_{snipe_price:.2f}",
                 )
 
-            # ── Phase 2: FIRE snipe + cancel opposing CONCURRENTLY ────────
-            # This is the critical latency optimization: the snipe order
-            # goes out at the SAME INSTANT as the cancel requests.
-            # The snipe is the profit generator; cancels are just risk mgmt.
-            # We do NOT wait for cancels before firing.
-            snipe_task  = asyncio.create_task(self._fire_order(snipe_token_id, snipe_price))
-            cancel_task = asyncio.create_task(self._cancel_side(opposing, active_orders))
+            # ── Phase 2: FIRE snipe + cancel opposing ─────────────────────
+            # If free capital is insufficient to cover the snipe cost, we must
+            # cancel opposing resting orders first to free collateral before
+            # posting the new FOK order. Otherwise we fire both concurrently.
+            free_balance = await asyncio.to_thread(self.bot._available_balance_micro)
+            estimated_cost_micro = int(snipe_price * self.snipe_shares * 1_000_000)
 
-            order_id, cancels_fired = await asyncio.gather(snipe_task, cancel_task)
+            if free_balance is not None and free_balance < estimated_cost_micro:
+                self.logger.debug(
+                    "Low balance ($%.4f < $%.4f) — sequential cancel-then-snipe",
+                    free_balance / 1_000_000, estimated_cost_micro / 1_000_000,
+                )
+                cancels_fired = await self._cancel_side(opposing, active_orders)
+                order_id = await self._fire_order(snipe_token_id, snipe_price)
+            else:
+                snipe_task  = asyncio.create_task(self._fire_order(snipe_token_id, snipe_price))
+                cancel_task = asyncio.create_task(self._cancel_side(opposing, active_orders))
+                order_id, cancels_fired = await asyncio.gather(snipe_task, cancel_task)
 
             latency_ms = (time.monotonic_ns() - start_ns) / 1e6
 

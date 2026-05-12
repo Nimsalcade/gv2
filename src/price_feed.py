@@ -241,6 +241,14 @@ class BinancePriceFeed:
                     self.logger.info("%s WebSocket connected | %s", self.asset, self.ws_url)
                     backoff = 1.0  # reset on successful connect
 
+                    # Purge stale ticks accumulated during the disconnect window.
+                    # Pre-reconnect prices compared against post-reconnect prices
+                    # would produce massive artificial momentum and trigger false
+                    # positive snipes.
+                    self._ticks.clear()
+                    self._current_price = None
+                    self._data_event.clear()
+
                     async for raw_msg in ws:
                         if not self.running:
                             break
